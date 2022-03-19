@@ -1,0 +1,292 @@
+---
+title: "Generating Slovenian Names with Keras/TensorFlow"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generative Deep Learning
+
+Recurrent neural networks can be used to generate sequence data such as text.
+The usual way to generate sequence data in deep learning is to train a network that predicts the next token in a sequence using the previous tokens as input.
+Let's explore how this method can be used to generate new Slovenian--sounding names.
+The same approach could be used for generating original company, brand or product names.
+
+This project was inspired by [this talk](https://www.youtube.com/watch?v=g2bQJIth1-I) by Jacqueline Nolis and the code was mostly "stolen" from [this Github repo](https://github.com/nolis-llc/pet-names).
+
+
+## Data Preparation
+
+A list of 667 Slovenian names has been obtained from [this](http://www.mojmalcek.si/clanki_in_nasveti/nosecnost/118/650_imen_za_novorojencka.html) website.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(keras)
+
+
+# data import -------------------------------------------------------------
+# source: http://www.mojmalcek.si/clanki_in_nasveti/nosecnost/118/650_imen_za_novorojencka.html
+
+names <- read_csv('data/names.txt') %>% clean_names()
+
+
+# data cleaning -----------------------------------------------------------
+
+names <- names %>% filter(str_length(name) > 1)
+names
+```
+
+Note that this is a list of distinct names and not a sample of names from population as in the original project.
+Also, the size of the training data is much smaller here.
+
+From each name we are going to create a bunch of training examples.
+The goal of the model that we are going to build is to predict the next letter from the previous ones.
+
+```{r}
+# modify the data so it's ready for a model
+# first we add a character to signify the end of the name ("+")
+# then we need to expand each name into subsequences (S, SP, SPO, SPOT) so we can predict each next character.
+# finally we make them sequences of the same length. So they can form a matrix
+
+# the subsequence data
+subsequence_data <-
+  names %>%
+  mutate(accumulated_name =
+           name %>%
+           str_c("+") %>% # add a stop character
+           str_split("") %>% # split into characters
+           map(~purrr::accumulate(.x, c)) # make into cumulative sequences
+  ) %>%
+  select(accumulated_name) %>% # get only the column with the names
+  unnest(accumulated_name) %>% # break the cumulations into individual rows
+  arrange(runif(n())) %>% # shuffle for good measure
+  pull(accumulated_name) # change to a list
+```
+
+Next, we create the character_lookup table where each letter is assigned to a number.
+
+```{r}
+character_lookup <- data.frame(character = c(LETTERS, "Č", "Š", "Ž", ".", "-", " ", "+"), 
+                               stringsAsFactors = FALSE)
+character_lookup[["character_id"]] <- 1:nrow(character_lookup)
+
+max_length <- 10
+num_characters <- nrow(character_lookup) + 1
+```
+
+Next step is to create a 3-dimensional text_matrix where each training example is represented by 11 characters.
+We want to predict the 11th character from the 10 previous ones.
+Padding with zeros is applied to cases with less than 10 predictor characters.
+All characters are 1--hot encoded into 34 "slots" of the third dimension.
+
+```{r}
+# the name data as a matrix. This will then have the last character split off to be the y data
+# this is nowhere near the fastest code that does what we need to, but it's easy to read so who cares?
+text_matrix <-
+  subsequence_data %>%
+  map(~character_lookup$character_id[match(.x, character_lookup$character)]) %>% # change characters into the right numbers
+  pad_sequences(maxlen = max_length + 1) %>% # add padding so all of the sequences have the same length
+  to_categorical(num_classes = num_characters) # 1-hot encode them (so like make 2 into [0,1,0,...,0])
+
+dim(text_matrix)
+```
+
+We can now extract the $x$ and $y$ matrices that will be used in model training.
+
+```{r}
+x_name <- text_matrix[, 1:max_length, ] # make the X data of the letters before
+y_name <- text_matrix[, max_length + 1, ] # make the Y data of the next letter
+```
+
+## Creating the Model
+
+We will use a two-layer [LSTM](https://en.wikipedia.org/wiki/Long_short-term_memory) network.
+Because we are performing multiclass, single--label classification, softmax activation and categorical crossentropy loss function must be used.
+
+```{r}
+# the input to the network
+input <- layer_input(shape = c(max_length, num_characters)) 
+
+# the name data needs to be processed using an LSTM, 
+# Check out Deep Learning with R (Chollet & Allaire, 2018) to learn more.
+output <- 
+  input %>%
+  layer_lstm(units = 64, return_sequences = TRUE) %>%
+  layer_lstm(units = 64, return_sequences = FALSE) %>%
+  layer_dropout(rate = 0.1) %>%
+  layer_dense(num_characters) %>%
+  layer_activation("softmax")
+
+# the actual model, compiled
+model <- keras_model(inputs = input, outputs = output) %>% 
+  compile(
+    optimizer = "adam",
+    loss = 'categorical_crossentropy',
+    metrics = c("accuracy")
+  )
+```
+
+We are now ready to fit the model.
+
+```{r message=FALSE}
+# here we run the model through the data 100 times. 
+fit_results <- model %>% keras::fit(
+  x_name, 
+  y_name,
+  batch_size = 64,
+  epochs = 100,
+  validation_split = 0.1
+)
+
+plot(fit_results)
+```
+
+The achieved validation accuracy and loss are not that great here.
+One reason for this is the fact that we are working with a list of distinct names.
+The alternative, a sample of names from population, would yield better results because some names from the validation set would have been present in the training set. 
+
+```{r}
+# save the model so that it can be used in the future
+save_model_hdf5(model,"models/model.h5")
+```
+
+## Generating the Names
+
+We are now going to use this model for generation of new names.
+
+The concept of temperature is introduced here. It controls how surprising or predictable the choice of the next character will be.
+Higher temperatures will produce more surprising results, whereas lower temperature will result in less randomness and more predictable outcomes.
+
+Let's define some functions that will be used in this final step.
+
+```{r}
+# a function that generates a single name from a model
+generate_name <- function(model, character_lookup, max_length, temperature = 1){
+  # model - the trained neural network
+  # character_lookup - the table for how characters convert to numbers
+  # max_length - the expected length of the training data in characters
+  # temperature - how weird to make the names, higher is weirder
+  
+  choose_next_char <- function(preds, character_lookup, temperature = 1){
+    preds <- log(preds) / temperature
+    exp_preds <- exp(preds)
+    preds <- exp_preds / sum(exp(preds))
+    
+    next_index <- which.max(as.integer(rmultinom(1, 1, preds)))
+    character_lookup$character[next_index - 1]
+  }
+  
+  in_progress_name <- character(0)
+  next_letter <- ""
+  
+  # while we haven't hit a stop character and the name isn't too long
+  while(next_letter != "+" && length(in_progress_name) < 30){
+    # prep the data to run in the model again
+    previous_letters_data <- 
+      lapply(list(in_progress_name), function(.x){
+        character_lookup$character_id[match(.x, character_lookup$character)]
+      })
+    previous_letters_data <- pad_sequences(previous_letters_data, maxlen = max_length)
+    previous_letters_data <- to_categorical(previous_letters_data, num_classes = num_characters)
+    
+    # get the probabilities of each possible next character by running the model
+    next_letter_probabilities <- 
+      predict(model,previous_letters_data)
+    
+    # determine what the actual letter is
+    next_letter <- choose_next_char(next_letter_probabilities,character_lookup,temperature)
+    
+    if(next_letter != "+")
+      # if the next character isn't stop add the latest generated character to the name and continue
+      in_progress_name <- c(in_progress_name,next_letter)
+  }
+  
+  # turn the list of characters into a single string
+  raw_name <- paste0(in_progress_name, collapse = "")
+  
+  # capitalize the first letter of each word
+  capitalized_name <- str_to_title(raw_name)
+  
+  return(capitalized_name)
+}
+
+
+# a function to generate many names
+generate_many_names <- function(n = 10, model, character_lookup, max_length, temperature = 1){
+  # n - the number of names to generate
+  # (then everything else you'd pass to generate_name)
+  return(unlist(lapply(1:n, function(x) generate_name(model, character_lookup, max_length, temperature))))
+}
+
+
+# a function to generate many new names: names from the training set are removed from result
+generate_many_new_names <- function(n = 10, model, character_lookup, max_length, temperature = 1, names){
+  # names - training dataset with original names
+  # n - number of names the model generates, NOT all of them are new so the output is usually smaller
+  
+  return(
+    generate_many_names(n, model, character_lookup, max_length, temperature) %>% 
+    enframe() %>% 
+    select(name = value) %>% 
+    distinct() %>% 
+    anti_join(names %>% mutate(name = str_to_title(name)), by = 'name') %>% 
+    arrange(name) %>% 
+    pull()
+  )
+}
+```
+
+## Results
+
+### Temperature = 0.01
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 0.01, names)
+```
+
+### Temperature = 0.2
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 0.2, names)
+```
+
+### Temperature = 0.4
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 0.4, names)
+```
+
+### Temperature = 0.6
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 0.6, names)
+```
+
+### Temperature = 0.8
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 0.8, names)
+```
+
+### Temperature = 1
+
+```{r}
+generate_many_new_names(n = 200, model, character_lookup, max_length, temperature = 1, names)
+```
+
+As expected, with lower temperatures the model generated more existing names from the training data as with higher temperatures.
+Also, some actual Slovenian names that were not present in the incomplete input table have been generated.
+
+
+## GitHub
+[https://github.com/tomazweiss/slovenian-name-generator](https://github.com/tomazweiss/slovenian-name-generator)
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
